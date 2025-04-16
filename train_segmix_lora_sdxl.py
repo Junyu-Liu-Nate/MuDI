@@ -73,6 +73,8 @@ from diffusers.utils.hub_utils import load_or_create_model_card, populate_model_
 from diffusers.utils.import_utils import is_xformers_available
 from diffusers.utils.torch_utils import is_compiled_module
 
+from custom_utils.dataset import DreamBoothMultiSynthDataset
+from modules.concept_predictor import ConceptClassifierSegmenter
 
 if is_wandb_available():
     import wandb
@@ -303,12 +305,12 @@ def parse_args(input_args=None):
         default=None,
         help="The config of the Dataset, leave as None if there's only one config.",
     )
-    parser.add_argument(
-        "--instance_data_dir",
-        type=str,
-        default=None,
-        help=("A folder containing the training data. "),
-    )
+    # parser.add_argument(
+    #     "--instance_data_dir",
+    #     type=str,
+    #     default=None,
+    #     help=("A folder containing the training data. "),
+    # )
 
     parser.add_argument(
         "--cache_dir",
@@ -705,7 +707,220 @@ def parse_args(input_args=None):
         type=float,
         default=1000
     )
-    
+
+    ##### Newly added helper funcs
+    def parse_comma_separated_list(string):
+        return string.split(',')
+
+    def parse_list_of_lists(string):
+        # Split the string into chunks where each chunk is a sublist
+        sublists = string.split(';')  # Use semicolon to separate sublists
+        return [sublist.strip().split(',') for sublist in sublists if sublist]  # Split each sublist into items
+
+    def parse_nested_list_of_strings(string):
+        # Assuming sublists are separated by a semicolon and elements by a comma
+        return [item.split(',') for item in string.split(';') if item]
+
+    #####----------- Newly added for part-level concepts learning -----------#####
+    ##########---------- Dataset ----------##########
+    parser.add_argument(
+        "--subject_name",
+        type=str,
+        default="chair",
+        required=True,
+        help="Subject name, like chair and racing car.",
+    )
+    parser.add_argument(
+        "--cross_img_sample",
+        action="store_true",
+        help="Whether to perform cross-image sampling.",
+    )
+    parser.add_argument(
+        "--instance_data_dir",
+        type=str,
+        default=None,
+        required=True,
+        help="A folder containing the training data of instance images.",
+    )
+    # parser.add_argument(
+    #     "--resolution",
+    #     type=int,
+    #     default=512,
+    #     help=(
+    #         "The resolution for input images, all the images in the train/validation dataset will be resized to this"
+    #         " resolution"
+    #     ),
+    # )
+    # parser.add_argument(
+    #     "--center_crop",
+    #     default=False,
+    #     action="store_true",
+    #     help=(
+    #         "Whether to center crop the input images to the resolution. If not set, the images will be randomly"
+    #         " cropped. The images will be resized to the resolution first before cropping."
+    #     ),
+    # )
+    parser.add_argument(
+        "--randomize_unused_mask_areas",
+        default=False,
+        action="store_true",
+        help=(
+            "Whether to randomize the unused mask areas. Aim to further improve disentanglement"
+        ),
+    )
+    parser.add_argument(
+        "--set_bg_white",
+        default=False,
+        action="store_true",
+        help=(
+            "Whether to set the background + unused mask areas to white."
+        ),
+    )
+    # parser.add_argument(
+    #     "--dataloader_num_workers",
+    #     type=int,
+    #     default=0,
+    #     help=(
+    #         "Number of subprocesses to use for data loading. 0 means that the data will be loaded in the main process."
+    #     ),
+    # )
+    parser.add_argument("--img_log_steps", type=int, default=200)
+    # parser.add_argument("--num_of_assets", type=int, default=1)
+    parser.add_argument("--assets_indices_lists", type=parse_list_of_lists, default=[], help="Input as '1,2,3;4,5,6;7,8,9' for [[1, 2, 3], [4, 5, 6], [7, 8, 9]]")
+    # parser.add_argument("--initializer_tokens", type=str, nargs="+", default=[])
+    parser.add_argument("--initializer_tokens_list", type=parse_nested_list_of_strings, default=[], help="Input nested lists as 'str1,str2;str3,str4'")
+    parser.add_argument("--val_mix_prompts", 
+                        nargs='+',
+                        default=None,
+                        help="A list of prompts that are sampled during validation for inference.",
+    )
+    parser.add_argument("--final_inference_prompts", 
+                        nargs='+',
+                        default=None,
+                        help="A list of prompts that are sampled during final inference.",
+    )
+
+    parser.add_argument(
+        "--placeholder_token",
+        type=str,
+        default="<asset>",
+        help="A token to use as a placeholder for the concept.",
+    )
+    parser.add_argument(
+        "--use_all_synth_imgs",
+        action="store_true",
+        help="Whether to use all synthetic images for training.",
+    )
+    # parser.add_argument(
+    #     "--synth_type",
+    #     type=int,
+    #     default=0,
+    #     help="Sythn type for the images synthesize by sampling across images.",
+    # )
+    parser.add_argument(
+        "--sample_type",
+        type=str,
+        choices=["fixed-num", "random-num", "per-part", "per-subject"],
+        required=False,
+        help="Specify the concept combination method to use. Choices are: random, per-part, per-subject."
+    )
+    parser.add_argument(
+        "--synth_type",
+        type=str,
+        choices=["4-corner", "2-subject", "random-no-overlap", "random-overlap"],
+        required=False,
+        help="Specify the img synthesis method to use. Choices are: 4-corner, 2-subject, random-no-overlap, random-overlap."
+    )
+    parser.add_argument(
+        "--sythn_detailed_prompt",
+        action="store_true",
+        help="Whether to use detailed prompt for synthetic image.",
+    )
+    parser.add_argument(
+        "--train_detailed_prompt",
+        action="store_true",
+        help="Whether to use detailed prompt for train image - the provided image.",
+    )
+    parser.add_argument(
+        "--use_all_instance",
+        action="store_true",
+        help="For running BaS baseline - use all union sampled instance images.",
+    )
+    ##### Learn token to represent background images
+    parser.add_argument(
+        "--use_bg_tokens",
+        action="store_true",
+        help="Whether to learn bg concept.",
+    )
+    parser.add_argument(
+        "--bg_indices",
+        type=parse_comma_separated_list,
+        default=[],
+        help="A list of indices for the background images.",
+    )
+    parser.add_argument(
+        "--bg_placeholder_token",
+        type=str,
+        default="<bg>",
+        help="A token to use as a placeholder for the bg concept.",
+    )
+    parser.add_argument(
+        "--bg_initializer_tokens",
+        type=parse_comma_separated_list,
+        default=[],
+        help="A comma-separated list of tokens to use as initializers for the bg concepts.",
+    )
+    parser.add_argument(
+        "--bg_data_dir",
+        type=str,
+        default=None,
+        help="A folder containing the training data of bg images.",
+    )
+
+    ##########---------- Training ----------##########
+    parser.add_argument(
+        "--do_not_apply_masked_loss",
+        action="store_false",
+        help="Use masked loss instead of standard epsilon prediciton loss",
+        dest="apply_masked_loss"
+    )
+    parser.add_argument(
+        "--apply_bg_loss",
+        action="store_true",
+        help="Add background loss to the diffusion loss - enforce the background to be white",
+    )
+    parser.add_argument(
+        "--bg_loss_weight",
+        type=float,
+        default=0.05,
+        help="weight for the background loss",
+    )
+    parser.add_argument(
+        "--train_concept_predictor",
+        action="store_true",
+        help="Use concept train_concept_predictor to predict the concept tokens - Maximize Mutual Information",
+    )
+    parser.add_argument(
+        "--predictor_type",
+        type=str,
+        choices=["classifier", "classifier_seg", "classifier_time", "classifier_seg_time", "classifier_seg_time_film", "regressor"],
+        help="Specify which concept predictor to use: classifier or regressor."
+    )
+    parser.add_argument(
+        "--concept_pred_weight",
+        type=float,
+        default=1.0,
+        help="weight for the train_concept_predictor loss",
+    )
+    parser.add_argument(
+        "--concept_pred_seg_scale",
+        type=float,
+        default=1.0,
+        help="scale for the seg loss in train_concept_predictor loss. If 1.0, it's averagly 1/10 of the classification loss.",
+    )
+
+    #####--------------------------------------------------------------------#####
+
     if input_args is not None:
         args = parser.parse_args(input_args)
     else:
@@ -1216,6 +1431,13 @@ def encode_prompt(text_encoders, tokenizers, prompt, text_input_ids_list=None):
     pooled_prompt_embeds = pooled_prompt_embeds.view(bs_embed, -1)
     return prompt_embeds, pooled_prompt_embeds
 
+def ensure_mask_format(mask):
+    # Ensure shape [B, 1, H, W]
+    if mask.ndim == 3:  # [B, H, W]
+        mask = mask.unsqueeze(1)
+    elif mask.ndim == 5:  # [B, P, 1, H, W]
+        mask = torch.max(mask, dim=1).values  # [B, 1, H, W]
+    return mask
 
 def main(args):
     if args.report_to == "wandb" and args.hub_token is not None:
@@ -1391,6 +1613,39 @@ def main(args):
         args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision, variant=args.variant
     )
 
+    #####--------- Add and initialize specialized tokens for concepts ---------#####
+    # -------- Add and initialize new tokens --------
+    total_assets_indices = [idx for group in args.assets_indices_lists for idx in group]
+    all_placeholder_tokens = [args.placeholder_token.replace(">", f"{idx}>") for idx in total_assets_indices]
+    placeholder_tokens = [[args.placeholder_token.replace(">", f"{idx}>") for idx in group] for group in args.assets_indices_lists]
+    print(f"All placeholder tokens: {all_placeholder_tokens}")
+
+    # Add to tokenizer
+    num_added_tokens = tokenizer_one.add_tokens(all_placeholder_tokens)
+    tokenizer_two.add_tokens(all_placeholder_tokens)
+    placeholder_token_ids = tokenizer_one.convert_tokens_to_ids(all_placeholder_tokens)
+
+    # Resize token embeddings
+    text_encoder_one.resize_token_embeddings(len(tokenizer_one))
+    text_encoder_two.resize_token_embeddings(len(tokenizer_two))
+
+    # Initialize embeddings
+    token_embeds_1 = text_encoder_one.get_input_embeddings().weight.data
+    token_embeds_2 = text_encoder_two.get_input_embeddings().weight.data
+
+    if len(args.initializer_tokens_list) > 0:
+        all_initializer_tokens = [t for group in args.initializer_tokens_list for t in group]
+        for i, init_token in enumerate(all_initializer_tokens):
+            init_id = tokenizer_one.encode(init_token, add_special_tokens=False)[0]
+            token_embeds_1[placeholder_token_ids[i]] = token_embeds_1[init_id]
+            token_embeds_2[placeholder_token_ids[i]] = token_embeds_2[init_id]
+    else:
+        # Randomly initialize from nearby
+        for i in range(len(placeholder_token_ids)):
+            token_embeds_1[placeholder_token_ids[i]] = token_embeds_1[-(3 * len(placeholder_token_ids)) + i]
+            token_embeds_2[placeholder_token_ids[i]] = token_embeds_2[-(3 * len(placeholder_token_ids)) + i]
+    #####----------------------------------------------------------------------#####
+
     # We only train the additional adapter LoRA layers
     vae.requires_grad_(False)
     text_encoder_one.requires_grad_(False)
@@ -1419,6 +1674,14 @@ def main(args):
 
     text_encoder_one.to(accelerator.device, dtype=weight_dtype)
     text_encoder_two.to(accelerator.device, dtype=weight_dtype)
+
+    #####--------- Initialize the concept predictor ---------#####
+    if args.train_concept_predictor:
+        concept_predictor = ConceptClassifierSegmenter(
+            latent_channels=4, latent_size=64, out_dim=NUM_TOKENS, hidden_dim=256
+        ).to(accelerator.device)
+        concept_predictor.train()
+    #####----------------------------------------------------#####
 
     if args.enable_xformers_memory_efficient_attention:
         if is_xformers_available():
@@ -1600,6 +1863,9 @@ def main(args):
     else:
         params_to_optimize = [unet_lora_parameters_with_lr]
 
+    if args.train_concept_predictor:
+        params_to_optimize.append({"params": concept_predictor.parameters(), "lr": args.learning_rate})
+
     # Optimizer creation
     if not (args.optimizer.lower() == "prodigy" or args.optimizer.lower() == "adamw"):
         logger.warning(
@@ -1670,26 +1936,52 @@ def main(args):
         )
 
     # Dataset and DataLoaders creation:
-    train_dataset = DreamBoothDataset(
-        train_data_root=args.instance_data_dir,
-        class_prompt=args.class_prompt,
-        class_data_root=args.class_data_dir if args.with_prior_preservation else None,
-        class_num=args.num_class_images,
-        size=args.resolution,
-        repeats=args.repeats,
-        center_crop=args.center_crop,
-        image_column='file_name',
-        caption_column='text',
-        segmix_prob=args.segmix_prob,
-        soft_alpha=args.soft_alpha
+    # train_dataset = DreamBoothDataset(
+    #     train_data_root=args.instance_data_dir,
+    #     class_prompt=args.class_prompt,
+    #     class_data_root=args.class_data_dir if args.with_prior_preservation else None,
+    #     class_num=args.num_class_images,
+    #     size=args.resolution,
+    #     repeats=args.repeats,
+    #     center_crop=args.center_crop,
+    #     image_column='file_name',
+    #     caption_column='text',
+    #     segmix_prob=args.segmix_prob,
+    #     soft_alpha=args.soft_alpha
+    # )
+    train_dataset = DreamBoothMultiSynthDataset(
+        instance_data_root=args.instance_data_dir,
+        placeholder_tokens=placeholder_tokens,
+        use_bg_tokens=args.use_bg_tokens,
+        bg_data_root=args.bg_data_dir,
+        bg_placeholder_tokens="",
+        size=1024,
+        center_crop=False,
+        flip_p=0.5,
+        randomize_unused_mask_areas=args.randomize_unused_mask_areas,
+        set_bg_white=args.set_bg_white,
+        use_all_sythn=args.use_all_synth_imgs,
+        use_all_instance=args.use_all_instance,
+        subject_name=args.subject_name,
+        sample_type=args.sample_type,
+        synth_type=args.synth_type,
+        train_detailed_prompt=args.train_detailed_prompt,
+        sythn_detailed_prompt=args.sythn_detailed_prompt,
     )
 
+    # train_dataloader = torch.utils.data.DataLoader(
+    #     train_dataset,
+    #     batch_size=args.train_batch_size,
+    #     shuffle=True,
+    #     collate_fn=lambda examples: collate_fn(examples, args.with_prior_preservation),
+    #     num_workers=args.dataloader_num_workers,
+    # )
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=args.train_batch_size,
         shuffle=True,
-        collate_fn=lambda examples: collate_fn(examples, args.with_prior_preservation),
-        num_workers=args.dataloader_num_workers,
+        collate_fn=train_dataset.collate_fn,  # <- add this
+        num_workers=4,
     )
 
     # Computes additional embeddings/ids required by the SDXL UNet.
@@ -1849,7 +2141,7 @@ def main(args):
                 prompts = batch["prompts"]
 
                 # encode batch prompts when custom prompts are provided for each image -
-                mask = batch["mask"]
+                # mask = batch["mask"]
 
                 # Convert images to latent space
                 model_input = vae.encode(pixel_values).latent_dist.sample()
@@ -1867,6 +2159,7 @@ def main(args):
                 # Sample noise that we'll add to the latents
                 noise = torch.randn_like(model_input)
                 bsz = model_input.shape[0]
+                print(f"batch size: {bsz}")
 
                 # Sample a random timestep for each image
                 if not args.do_edm_style_training:
@@ -1894,28 +2187,52 @@ def main(args):
                     else:
                         inp_noisy_latents = noisy_model_input / ((sigmas**2 + 1) ** 0.5)
 
+                #################
+                # # Calculate the elements to repeat depending on the use of prior-preservation and custom captions.
+                # if not train_dataset.custom_instance_prompts:
+                #     elems_to_repeat_text_embeds = bsz // 2 if args.with_prior_preservation else bsz
+                #     elems_to_repeat_time_ids = bsz // 2 if args.with_prior_preservation else bsz
+                # else:
+                #     elems_to_repeat_text_embeds = 1
+                #     elems_to_repeat_time_ids = bsz // 2 if args.with_prior_preservation else bsz
 
-                # Calculate the elements to repeat depending on the use of prior-preservation and custom captions.
-                if not train_dataset.custom_instance_prompts:
-                    elems_to_repeat_text_embeds = bsz // 2 if args.with_prior_preservation else bsz
-                    elems_to_repeat_time_ids = bsz // 2 if args.with_prior_preservation else bsz
-                else:
-                    elems_to_repeat_text_embeds = 1
-                    elems_to_repeat_time_ids = bsz // 2 if args.with_prior_preservation else bsz
+                # print(f'add_time_ids: {add_time_ids}')
+                # print(f'elems_to_repeat_time_ids: {elems_to_repeat_time_ids}')
+                # # Predict the noise residual
+                # unet_added_conditions = {"time_ids": add_time_ids.repeat(elems_to_repeat_time_ids, 1)}
+                #################
 
-                # Predict the noise residual
-                unet_added_conditions = {"time_ids": add_time_ids.repeat(elems_to_repeat_time_ids, 1)}
+                #################
+                # Compute correct time_ids
+                original_size = (args.resolution, args.resolution)
+                crop_coords = (0, 0)
+                target_size = (args.resolution, args.resolution)
+
+                # Construct [6] vector: [H_orig, W_orig, crop_top, crop_left, H_target, W_target]
+                time_ids = torch.tensor([*original_size, *crop_coords, *target_size], device=model_input.device, dtype=weight_dtype)
+
+                # Repeat to match batch size
+                add_time_ids = time_ids.unsqueeze(0).repeat(bsz, 1)  # shape: [bsz, 6]
+                # print(f'add_time_ids: {add_time_ids}')
+                unet_added_conditions = {"time_ids": add_time_ids}
+                #################
+                
+                # print(f'prompts: {prompts}')
                 prompt_embeds, pooled_prompt_embeds = encode_prompt(
                     text_encoders=[text_encoder_one, text_encoder_two],
                     tokenizers=[tokenizer_one, tokenizer_two],
                     prompt=prompts,
                     text_input_ids_list=None,
                 )
+                # print(f'prompt_embeds shape: {prompt_embeds.shape}')
+                # print(f'pooled_prompt_embeds shape: {pooled_prompt_embeds.shape}')
                 unet_added_conditions.update(
                     # {"text_embeds": pooled_prompt_embeds.repeat(elems_to_repeat_text_embeds, 1)}
                     {"text_embeds": pooled_prompt_embeds}
                 )
+
                 # prompt_embeds_input = prompt_embeds.repeat(elems_to_repeat_text_embeds, 1, 1)
+                # print(f'unet_added_conditions: {unet_added_conditions}')
                 prompt_embeds_input = prompt_embeds
                 model_pred = unet(
                     inp_noisy_latents if args.do_edm_style_training else noisy_model_input,
@@ -1988,7 +2305,9 @@ def main(args):
                         prior_loss = (prior_loss * prior_mask).mean()
 
                 if args.snr_gamma is None:
+                    print(f'Check snr_gamma is None')
                     if weighting is not None:
+                        print(f'Check weighting is not None')
                         loss = torch.mean(
                             (weighting.float() * (model_pred.float() - target.float()) ** 2).reshape(
                                 target.shape[0], -1
@@ -2008,16 +2327,140 @@ def main(args):
                             inside_term = -1 * args.dco_beta * diff
                             loss = -1 * torch.nn.LogSigmoid()(inside_term)
                     else:
-                        loss = F.mse_loss(model_pred.float(), target.float(), reduction="none")
-                        loss = (loss * mask).mean()
+                        print(f'Check weighting is None')
+                        # loss = F.mse_loss(model_pred.float(), target.float(), reduction="none")
+                        # loss = (loss * mask).mean()
+                        #####---------- Added for masks produced by dynamic data synth ----------#####
+                        if args.apply_masked_loss:
+                            # Split batch in half
+                            model_pred_synth, model_pred_inst = torch.chunk(model_pred, 2, dim=0)
+                            target_synth, target_inst = torch.chunk(target, 2, dim=0)
+                            # print(f'model_pred_synth shape: {model_pred_synth.shape}')
+                            # print(f'model_pred_inst shape: {model_pred_inst.shape}')
+
+                            # Get masks and downsample
+                            synth_masks = torch.max(batch["synth_masks"], dim=1).values
+                            inst_masks = torch.max(batch["instance_masks"], dim=1).values
+                            synth_masks = ensure_mask_format(batch["synth_masks"])
+                            inst_masks = ensure_mask_format(batch["instance_masks"])
+                            synth_masks = F.interpolate(synth_masks, size=(128, 128), mode="nearest").squeeze(1)
+                            inst_masks = F.interpolate(inst_masks, size=(128, 128), mode="nearest").squeeze(1)
+                            synth_masks = (synth_masks > 0.1).float()
+                            inst_masks = (inst_masks > 0.1).float()
+
+                            if args.apply_bg_loss:
+                                synth_weights = synth_masks + (1.0 - synth_masks) * args.bg_loss_weight
+                                inst_weights = inst_masks + (1.0 - inst_masks) * args.bg_loss_weight
+                            else:
+                                synth_weights = synth_masks
+                                inst_weights = inst_masks
+
+                            synth_weights = synth_weights.unsqueeze(1)
+                            inst_weights = inst_weights.unsqueeze(1)
+
+                            mse_synth = (model_pred_synth - target_synth) ** 2 * synth_weights
+                            mse_inst = (model_pred_inst - target_inst) ** 2 * inst_weights
+                            loss = mse_synth.mean() + mse_inst.mean()
+                        else:
+                            loss = F.mse_loss(model_pred.float(), target.float(), reduction="none")
+                            loss = (loss * mask).mean()
+                        #####------------------------------------------------------------#####
+                        
                         if args.dco_beta > 0.0:
-                            loss_dco = F.mse_loss(model_pred_dco.float(), target.float(), reduction="none")
-                            loss_dco = (loss_dco * mask).mean()
+                            # loss_dco = F.mse_loss(model_pred_dco.float(), target.float(), reduction="none")
+                            # loss_dco = (loss_dco * mask).mean()
+                            #####---------- Added for masks produced by dynamic data synth ----------#####
+                            if args.apply_masked_loss:
+                                # Split DCO preds and targets
+                                model_pred_dco_synth, model_pred_dco_inst = torch.chunk(model_pred_dco, 2, dim=0)
+
+                                # Downsample and binarize masks
+                                synth_masks = torch.max(batch["synth_masks"], dim=1).values
+                                inst_masks = torch.max(batch["instance_masks"], dim=1).values
+                                # Apply fix
+                                synth_masks = ensure_mask_format(batch["synth_masks"])
+                                inst_masks = ensure_mask_format(batch["instance_masks"])
+                                synth_masks = F.interpolate(synth_masks, size=(128, 128), mode="nearest").squeeze(1)
+                                inst_masks = F.interpolate(inst_masks, size=(128, 128), mode="nearest").squeeze(1)
+                                synth_masks = (synth_masks > 0.1).float()
+                                inst_masks = (inst_masks > 0.1).float()
+
+                                if args.apply_bg_loss:
+                                    synth_weights = synth_masks + (1.0 - synth_masks) * args.bg_loss_weight
+                                    inst_weights = inst_masks + (1.0 - inst_masks) * args.bg_loss_weight
+                                else:
+                                    synth_weights = synth_masks
+                                    inst_weights = inst_masks
+
+                                synth_weights = synth_weights.unsqueeze(1)
+                                inst_weights = inst_weights.unsqueeze(1)
+
+                                # Compute masked MSE for DCO
+                                mse_dco_synth = (model_pred_dco_synth - target_synth) ** 2 * synth_weights
+                                mse_dco_inst = (model_pred_dco_inst - target_inst) ** 2 * inst_weights
+                                loss_dco = mse_dco_synth.mean() + mse_dco_inst.mean()
+                            else:
+                                loss_dco = F.mse_loss(model_pred_dco.float(), target.float(), reduction="none")
+                                loss_dco = (loss_dco * mask).mean()
+                            #####------------------------------------------------------------#####
+
                             diff = loss - loss_dco
                             inside_term = -1 * args.dco_beta * diff
                             loss = -1 * torch.nn.LogSigmoid()(inside_term)
                 else:
                     raise NotImplementedError("SNR-based loss weights are not yet supported.")
+
+                #####---------- Added concept predictor ----------#####
+                if args.train_concept_predictor:
+                    # === Get denoised latents ===
+                    if noise_scheduler.config.prediction_type == "epsilon":
+                        alpha_t = noise_scheduler.alphas_cumprod[timesteps].view(-1, 1, 1, 1)  # [B,1,1,1]
+                        denoised_latents = (noisy_model_input - (1 - alpha_t).sqrt() * model_pred) / alpha_t.sqrt()
+                    else:
+                        raise NotImplementedError("Only epsilon prediction supported for concept prediction.")
+
+                    # === Split into synth/instance ===
+                    denoised_synth, denoised_inst = torch.chunk(denoised_latents, 2, dim=0)
+                    synth_token_ids = torch.stack(batch["synth_token_ids"])
+                    inst_token_ids = batch["token_ids"]
+                    token_id_list = [synth_token_ids, inst_token_ids]
+
+                    synth_masks = batch["synth_masks"]
+                    inst_masks = batch["instance_masks"]
+
+                    if synth_masks.ndim == 5:
+                        synth_masks = synth_masks.squeeze(2)
+                    if inst_masks.ndim == 5:
+                        inst_masks = inst_masks.squeeze(2)
+
+                    synth_masks = F.interpolate(synth_masks, size=(64, 64), mode="nearest")
+                    inst_masks = F.interpolate(inst_masks, size=(64, 64), mode="nearest")
+                    synth_masks = (synth_masks > 0.1).float()
+                    inst_masks = (inst_masks > 0.1).float()
+                    mask_list = [synth_masks, inst_masks]
+
+                    concept_pred_loss = 0.0
+                    for i, (latents_i, token_ids_i, masks_i) in enumerate(zip([denoised_synth, denoised_inst], token_id_list, mask_list)):
+                        logits_cls, logits_mask = concept_predictor(latents_i.unsqueeze(0))  # (1, C), (1, C, 64, 64)
+
+                        cls_labels = torch.zeros_like(logits_cls)
+                        for tid in token_ids_i[0]:
+                            cls_labels[0, tid] = 1.0
+
+                        cls_loss = F.binary_cross_entropy_with_logits(logits_cls, cls_labels)
+
+                        # Build GT segmentation mask
+                        gt_mask = torch.zeros_like(logits_mask)
+                        for ch, tid in enumerate(token_ids_i[0]):
+                            gt_mask[0, tid] = masks_i[0, ch]
+
+                        seg_loss = F.binary_cross_entropy_with_logits(logits_mask, gt_mask)
+                        concept_pred_loss += cls_loss + args.concept_pred_seg_scale * seg_loss
+
+                    # Scale and add to total loss
+                    loss = loss + args.concept_pred_weight * concept_pred_loss
+                    logs["info_loss"] = concept_pred_loss.detach().item()
+                #####------------------------------------------------------------#####
 
                 if args.with_prior_preservation:
                     # Add the prior loss to the instance loss.
