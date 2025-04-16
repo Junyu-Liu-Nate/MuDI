@@ -1,0 +1,9 @@
+{"id": {"a": "armrest0", "b": "backrest0", "c": "legs0", "d": "seat0", "e": "armrest1", "f": "backrest1", "g": "legs1", "h": "seat1"}}
+{"id": "a", "file_name": "a00.jpg", "mask_path": "mask_a00.png", "text": "A photo of a chair with component armrest0 on a simple clean background."}
+{"id": "b", "file_name": "b00.jpg", "mask_path": "mask_b00.png", "text": "A photo of a chair with component backrest0 on a simple clean background."}
+{"id": "c", "file_name": "c00.jpg", "mask_path": "mask_c00.png", "text": "A photo of a chair with component legs0 on a simple clean background."}
+{"id": "d", "file_name": "d00.jpg", "mask_path": "mask_d00.png", "text": "A photo of a chair with component seat0 on a simple clean background."}
+{"id": "e", "file_name": "e00.jpg", "mask_path": "mask_e00.png", "text": "A photo of a chair with component armrest1 on a simple clean background."}
+{"id": "f", "file_name": "f00.jpg", "mask_path": "mask_f00.png", "text": "A photo of a chair with component backrest1 on a simple clean background."}
+{"id": "g", "file_name": "g00.jpg", "mask_path": "mask_g00.png", "text": "A photo of a chair with component legs1 on a simple clean background."}
+{"id": "h", "file_name": "h00.jpg", "mask_path": "mask_h00.png", "text": "A photo of a chair with component seat1 on a simple clean background."}

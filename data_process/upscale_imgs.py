@@ -12,6 +12,6 @@ def upscale_images(input_folder, output_folder):
                 upscaled_img.save(output_path)
 
 if __name__ == "__main__":
-    in_folder = "/users/ljunyu/data/ljunyu/projects/few_shot_concept/code/break-a-scene/examples/chair_09_299/chair299/"
-    out_folder = "/users/ljunyu/data/ljunyu/projects/few_shot_concept/code/MuDI/examples/chair_09_299/chair299/"
+    in_folder = "/users/ljunyu/data/ljunyu/projects/few_shot_concept/code/MuDI/dataset/category/chair_09_299"
+    out_folder = "/users/ljunyu/data/ljunyu/projects/few_shot_concept/code/MuDI/dataset/category/chair_09_299"
     upscale_images(in_folder, out_folder)
