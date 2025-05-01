@@ -782,6 +782,22 @@ def parse_args(input_args=None):
         type=float,
         default=1000
     )
+    ######## Added for new tokens ########
+    ##### Newly added helper funcs
+    
+    parser.add_argument(
+        "--train_token_embeds",
+        nargs="+",
+        default=[],
+        help="List of new concept tokens to train, e.g., <v1> <v2> <v3>"
+    )
+
+    parser.add_argument(
+        "--initializer_tokens_list",
+        nargs="+",
+        default=[],
+        help="List of initializer base tokens to copy from (optional). Format: 'dog' 'cat' 'car'"
+    )
     
     if input_args is not None:
         args = parser.parse_args(input_args)
@@ -915,6 +931,7 @@ class DreamBoothDataset(Dataset):
         info = instance_dict_list[0]
         self.id_to_placeholder = info['id'] # {"a": "sks can", "b": "olis toy" ...}
         self.category_list = list(self.id_to_placeholder.keys()) # ['sks dog', 'olis toy']
+        # print(f"category_list: {self.category_list}")
         scale = args.relative_scale
         assert abs(scale) <= 1.
         if scale > 0:
@@ -926,6 +943,7 @@ class DreamBoothDataset(Dataset):
         self.scale_dict = scale_dict # info.get('scale') # {"a": 1.0, "b": 0.5}
         global placeholders
         placeholders = list(c.split(' ')[0] for c in self.id_to_placeholder.values()) # ['sks', 'olis']
+        # print(f"placeholders: {placeholders}")
 
         self.category_instance_images = defaultdict(list)
 
@@ -945,7 +963,7 @@ class DreamBoothDataset(Dataset):
             self.category_instance_images[category].append({"image":img, "mask":mask})
 
             instance_image_caption.append((img, mask, caption, category)) 
-
+        # print(f"instance_image_caption: {instance_image_caption}")
 
         self.instance_images_captions = []
         for img, mask, caption, category in instance_image_caption:
@@ -1148,10 +1166,13 @@ class DreamBoothDataset(Dataset):
         # default (no segmix)
         do_segmix = False
 
+        # print(f'self.segmix_prob: {self.segmix_prob}')
         if random.random() < self.segmix_prob:
+            # print("check is doing segmix")
             do_segmix = True
 
         is_first = None
+        # print(f'self.start_segmix: {self.start_segmix}')
         if do_segmix and self.start_segmix:
             additional_category = random.choice([c for c in self.category_list if c != category])
             additional_instance_dict = random.choice(self.category_instance_images[additional_category])
@@ -1171,6 +1192,9 @@ class DreamBoothDataset(Dataset):
 
             example["mask_map"] = self.mask_to_tensor(merged_mask_map) * (1 - self.soft_alpha) + self.soft_alpha
 
+            # merged.save(f"merged_image.png")
+            # print(f'example["instance_prompt"]: {example["instance_prompt"]}')
+            # exit()
         else:
             example["instance_images"] = self.image_transforms(instance_image)
             if isinstance(caption, (list, np.ndarray)):
@@ -1274,6 +1298,7 @@ def encode_prompt(text_encoders, tokenizers, prompt, text_input_ids_list=None):
         if tokenizers is not None:
             tokenizer = tokenizers[i]
             text_input_ids = tokenize_prompt(tokenizer, prompt)
+            # print(f"text_input_ids for text encoder {i}: {text_input_ids}")
         else:
             assert text_input_ids_list is not None
             text_input_ids = text_input_ids_list[i]
@@ -1288,6 +1313,32 @@ def encode_prompt(text_encoders, tokenizers, prompt, text_input_ids_list=None):
         bs_embed, seq_len, _ = prompt_embeds.shape
         prompt_embeds = prompt_embeds.view(bs_embed, seq_len, -1)
         prompt_embeds_list.append(prompt_embeds)
+
+        ######################## Test tokenizer behaviors ######################## 
+    #     arm0_id = tokenizer.encode("abc", add_special_tokens=False)
+    #     arm1_id = tokenizer.encode("def", add_special_tokens=False)
+    #     arm0_prompt_id = tokenizer("abc", padding="max_length", max_length=tokenizer.model_max_length, truncation=True, return_tensors="pt")
+    #     arm1_prompt_id = tokenizer("def", padding="max_length", max_length=tokenizer.model_max_length, truncation=True, return_tensors="pt",)
+    #     print("Token ID for 'armrest0':", arm0_id)
+    #     print("Token ID for 'armrest1':", arm1_id)
+    #     print("Token ID for 'armrest0' in prompt:", arm0_prompt_id)
+    #     print("Token ID for 'armrest1' in prompt:", arm1_prompt_id)
+
+    #     if arm0_id == arm1_id:
+    #         print("'armrest0' and 'armrest1' share the same token ID.")
+    #     else:
+    #         print("'armrest0' and 'armrest1' do not share the same token ID.")
+
+    #     if len(arm0_id) == 1 and arm0_id[0] in text_input_ids:
+    #         found_positions = (text_input_ids == arm0_id[0]).nonzero(as_tuple=True)
+    #         print("'armrest0' embedding:", prompt_embeds[found_positions[0], found_positions[1], :])
+
+    #     if len(arm1_id) == 1 and arm1_id[0] in text_input_ids:
+    #         found_positions = (text_input_ids == arm1_id[0]).nonzero(as_tuple=True)
+    #         print("'armrest1' embedding:", prompt_embeds[found_positions[0], found_positions[1], :])
+    #     # exit()
+    # exit()
+    ############################################################# 
 
     prompt_embeds = torch.concat(prompt_embeds_list, dim=-1)
     pooled_prompt_embeds = pooled_prompt_embeds.view(bs_embed, -1)
@@ -1451,6 +1502,39 @@ def main(args):
     text_encoder_two = text_encoder_cls_two.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="text_encoder_2", revision=args.revision, variant=args.variant
     )
+
+    ###################### Added for initializing tokens ######################
+    if args.train_token_embeds:
+        # --- Add and initialize new concept tokens ---
+        all_placeholder_tokens = args.train_token_embeds
+        num_added_tokens = tokenizer_one.add_tokens(all_placeholder_tokens)
+        tokenizer_two.add_tokens(all_placeholder_tokens)
+        placeholder_token_ids = tokenizer_one.convert_tokens_to_ids(all_placeholder_tokens)
+        print(f'all_placeholder_tokens: {all_placeholder_tokens}')
+        print(f'placeholder_token_ids: {placeholder_token_ids}')
+
+        # Resize text encoder embeddings
+        text_encoder_one.resize_token_embeddings(len(tokenizer_one))
+        text_encoder_two.resize_token_embeddings(len(tokenizer_two))
+
+        # Initialize embeddings
+        token_embeds_1 = text_encoder_one.get_input_embeddings().weight.data
+        token_embeds_2 = text_encoder_two.get_input_embeddings().weight.data
+
+        if len(args.initializer_tokens_list) > 0:
+            # all_initializer_tokens = [t for group in args.initializer_tokens_list for t in group]
+            print(f'args.initializer_tokens_list: {args.initializer_tokens_list}')
+            for i, init_token in enumerate(args.initializer_tokens_list):
+                init_id = tokenizer_one.encode(init_token, add_special_tokens=False)[0]
+                token_embeds_1[placeholder_token_ids[i]] = token_embeds_1[init_id]
+                token_embeds_2[placeholder_token_ids[i]] = token_embeds_2[init_id]
+        else:
+            for i in range(len(placeholder_token_ids)):
+                token_embeds_1[placeholder_token_ids[i]] = token_embeds_1[-(3 * len(placeholder_token_ids)) + i]
+                token_embeds_2[placeholder_token_ids[i]] = token_embeds_2[-(3 * len(placeholder_token_ids)) + i]
+    ###########################################################################
+    
+
     vae_path = (
         args.pretrained_model_name_or_path
         if args.pretrained_vae_model_name_or_path is None
@@ -1476,6 +1560,18 @@ def main(args):
     vae.requires_grad_(False)
     text_encoder_one.requires_grad_(False)
     text_encoder_two.requires_grad_(False)
+
+    ###########
+    # Enable gradients only on concept token embeddings
+    if args.train_token_embeds:
+        embedding_1 = text_encoder_one.get_input_embeddings()
+        embedding_2 = text_encoder_two.get_input_embeddings()
+
+        # Ensure the embedding weight as a whole is marked trainable
+        embedding_1.weight.requires_grad = True
+        embedding_2.weight.requires_grad = True
+    #############
+
     unet.requires_grad_(False)
 
     # For mixed precision training we cast all non-trainable weights (vae, non-lora text_encoder and non-lora unet) to half-precision
@@ -1678,6 +1774,13 @@ def main(args):
             text_lora_parameters_one_with_lr,
             text_lora_parameters_two_with_lr,
         ]
+    elif args.train_token_embeds:
+        print(f'Check is train_token_embeds')
+        embed_params = [
+            {"params": [embedding_1.weight], "lr": args.text_encoder_lr, "weight_decay": 0.},
+            {"params": [embedding_2.weight], "lr": args.text_encoder_lr, "weight_decay": 0.}
+        ]
+        params_to_optimize = [unet_lora_parameters_with_lr] + embed_params
     else:
         params_to_optimize = [unet_lora_parameters_with_lr]
 
@@ -1995,6 +2098,7 @@ def main(args):
                     prompt=prompts,
                     text_input_ids_list=None,
                 )
+                # exit()
                 unet_added_conditions.update(
                     # {"text_embeds": pooled_prompt_embeds.repeat(elems_to_repeat_text_embeds, 1)}
                     {"text_embeds": pooled_prompt_embeds}
@@ -2108,6 +2212,19 @@ def main(args):
                     loss = loss + args.prior_loss_weight * prior_loss
 
                 accelerator.backward(loss)
+
+                if args.train_token_embeds:
+                    with torch.no_grad():
+                        grad_1 = embedding_1.weight.grad
+                        grad_2 = embedding_2.weight.grad
+                        mask_1 = torch.zeros_like(grad_1)
+                        mask_2 = torch.zeros_like(grad_2)
+                        for token_id in placeholder_token_ids:
+                            mask_1[token_id] = 1
+                            mask_2[token_id] = 1
+                        grad_1 *= mask_1
+                        grad_2 *= mask_2
+
                 if accelerator.sync_gradients:
                     params_to_clip = (
                         itertools.chain(unet_lora_parameters, text_lora_parameters_one, text_lora_parameters_two)
@@ -2322,4 +2439,11 @@ def main(args):
 
 if __name__ == "__main__":
     args = parse_args()
+
+    if args.train_token_embeds:
+        # Disable AMP if only training token embeddings (which are FP32)
+        if args.train_token_embeds and not args.train_text_encoder:
+            print("Disabling AMP since only token embeddings are trained (FP32)")
+            args.mixed_precision = "no"
+
     main(args)

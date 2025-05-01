@@ -79,6 +79,7 @@ from modules.concept_predictor import ConceptClassifierSegmenter
 if is_wandb_available():
     import wandb
 
+from datetime import datetime
 from collections import defaultdict
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
@@ -178,67 +179,124 @@ Please adhere to the licensing terms as described [here](https://huggingface.co/
     model_card.save(os.path.join(repo_folder, "README.md"))
 
 
-def log_validation(
-    pipeline,
-    args,
-    accelerator,
-    pipeline_args,
-    epoch,
-    is_final_validation=False,
-):
+# def log_validation(
+#     pipeline,
+#     args,
+#     accelerator,
+#     pipeline_args,
+#     epoch,
+#     is_final_validation=False,
+# ):
+#     logger.info(
+#         f"Running validation... \n Generating {args.num_validation_images} images with prompt:"
+#         f" {args.validation_prompt}."
+#     )
+
+#     # We train on the simplified learning objective. If we were previously predicting a variance, we need the scheduler to ignore it
+#     scheduler_args = {}
+
+#     if not args.do_edm_style_training:
+#         if "variance_type" in pipeline.scheduler.config:
+#             variance_type = pipeline.scheduler.config.variance_type
+
+#             if variance_type in ["learned", "learned_range"]:
+#                 variance_type = "fixed_small"
+
+#             scheduler_args["variance_type"] = variance_type
+
+#         pipeline.scheduler = DPMSolverMultistepScheduler.from_config(pipeline.scheduler.config, **scheduler_args)
+
+#     pipeline = pipeline.to(accelerator.device)
+#     pipeline.set_progress_bar_config(disable=True)
+
+#     # run inference
+#     generator = torch.Generator(device=accelerator.device).manual_seed(args.seed) if args.seed else None
+#     # Currently the context determination is a bit hand-wavy. We can improve it in the future if there's a better
+#     # way to condition it. Reference: https://github.com/huggingface/diffusers/pull/7126#issuecomment-1968523051
+#     if torch.backends.mps.is_available() or "playground" in args.pretrained_model_name_or_path:
+#         autocast_ctx = nullcontext()
+#     else:
+#         autocast_ctx = torch.autocast(accelerator.device.type)
+
+#     with autocast_ctx:
+#         images = [pipeline(**pipeline_args, generator=generator).images[0] for _ in range(args.num_validation_images)]
+
+#     for tracker in accelerator.trackers:
+#         phase_name = "test" if is_final_validation else "validation"
+#         if tracker.name == "tensorboard":
+#             np_images = np.stack([np.asarray(img) for img in images])
+#             tracker.writer.add_images(phase_name, np_images, epoch, dataformats="NHWC")
+#         if tracker.name == "wandb":
+#             tracker.log(
+#                 {
+#                     phase_name: [
+#                         wandb.Image(image, caption=f"{i}: {args.validation_prompt}") for i, image in enumerate(images)
+#                     ]
+#                 }
+#             )
+
+#     del pipeline
+#     if torch.cuda.is_available():
+#         torch.cuda.empty_cache()
+
+#     return images
+
+def log_validation(pipeline, args, accelerator, pipeline_args_base, epoch, is_final_validation=False):
+    if pipeline_args_base['validation_type'] == 'ori':
+        prompts = args.val_ori_prompts
+    elif pipeline_args_base['validation_type'] == 'mix':
+        prompts = args.val_mix_prompts
+    else:
+        raise ValueError(f"Unknown validation type: {pipeline_args_base['validation_type']}")
+
     logger.info(
-        f"Running validation... \n Generating {args.num_validation_images} images with prompt:"
-        f" {args.validation_prompt}."
+        f"Running validation... Generating {args.num_validation_images} images for each prompt..."
     )
-
-    # We train on the simplified learning objective. If we were previously predicting a variance, we need the scheduler to ignore it
-    scheduler_args = {}
-
-    if not args.do_edm_style_training:
-        if "variance_type" in pipeline.scheduler.config:
-            variance_type = pipeline.scheduler.config.variance_type
-
-            if variance_type in ["learned", "learned_range"]:
-                variance_type = "fixed_small"
-
-            scheduler_args["variance_type"] = variance_type
-
-        pipeline.scheduler = DPMSolverMultistepScheduler.from_config(pipeline.scheduler.config, **scheduler_args)
 
     pipeline = pipeline.to(accelerator.device)
     pipeline.set_progress_bar_config(disable=True)
 
-    # run inference
     generator = torch.Generator(device=accelerator.device).manual_seed(args.seed) if args.seed else None
-    # Currently the context determination is a bit hand-wavy. We can improve it in the future if there's a better
-    # way to condition it. Reference: https://github.com/huggingface/diffusers/pull/7126#issuecomment-1968523051
-    if torch.backends.mps.is_available() or "playground" in args.pretrained_model_name_or_path:
-        autocast_ctx = nullcontext()
-    else:
-        autocast_ctx = torch.autocast(accelerator.device.type)
+    all_images = []
 
-    with autocast_ctx:
-        images = [pipeline(**pipeline_args, generator=generator).images[0] for _ in range(args.num_validation_images)]
+    # Determine tracker logging name
+    if is_final_validation:
+        phase_name = "test_ori" if pipeline_args_base['validation_type'] == 'ori' else "test_mix"
+    else:
+        phase_name = "validation_ori" if pipeline_args_base['validation_type'] == 'ori' else "validation_mix"
+
+    # For wandb, collect all images under the same key
+    wandb_log_images = []
+
+    for p_idx, prompt in enumerate(prompts):
+        pipeline_args = pipeline_args_base.copy()
+        pipeline_args["prompt"] = prompt
+
+        with torch.autocast(accelerator.device.type) if not torch.backends.mps.is_available() else nullcontext():
+            images = [
+                pipeline(**pipeline_args, generator=generator).images[0]
+                for _ in range(args.num_validation_images)
+            ]
+        all_images.extend(images)
+
+        for tracker in accelerator.trackers:
+            if tracker.name == "tensorboard":
+                np_images = np.stack([np.asarray(img) for img in images])
+                tracker.writer.add_images(f"{phase_name}/{p_idx}", np_images, epoch, dataformats="NHWC")
+            elif tracker.name == "wandb":
+                wandb_log_images.extend([
+                    wandb.Image(image, caption=f"[{p_idx}] {prompt}") for image in images
+                ])
 
     for tracker in accelerator.trackers:
-        phase_name = "test" if is_final_validation else "validation"
-        if tracker.name == "tensorboard":
-            np_images = np.stack([np.asarray(img) for img in images])
-            tracker.writer.add_images(phase_name, np_images, epoch, dataformats="NHWC")
         if tracker.name == "wandb":
-            tracker.log(
-                {
-                    phase_name: [
-                        wandb.Image(image, caption=f"{i}: {args.validation_prompt}") for i, image in enumerate(images)
-                    ]
-                }
-            )
+            tracker.log({phase_name: wandb_log_images})
 
     del pipeline
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    return images
+    return all_images
 
 
 def import_model_class_from_model_name_or_path(
@@ -300,6 +358,12 @@ def parse_args(input_args=None):
         ),
     )
     parser.add_argument(
+        "--run_name",
+        type=str,
+        default=None,
+        help=("experimemt name"),
+    )
+    parser.add_argument(
         "--dataset_config_name",
         type=str,
         default=None,
@@ -356,16 +420,28 @@ def parse_args(input_args=None):
         default=None,
         help="The prompt to specify images in the same class as provided instance images.",
     )
+    # parser.add_argument(
+    #     "--validation_prompt",
+    #     type=str,
+    #     default=None,
+    #     help="A prompt that is used during validation to verify that the model is learning.",
+    # )
     parser.add_argument(
-        "--validation_prompt",
-        type=str,
+        "--val_ori_prompts",
+        nargs="+",  # Accepts multiple prompts via space or quoting
         default=None,
-        help="A prompt that is used during validation to verify that the model is learning.",
+        help="List of validation prompts used during validation - validate ori comb. of concepts.",
+    )
+    parser.add_argument(
+        "--val_mix_prompts",
+        nargs="+",  # Accepts multiple prompts via space or quoting
+        default=None,
+        help="List of validation prompts used during validation - validate mix comb. of concepts.",
     )
     parser.add_argument(
         "--num_validation_images",
         type=int,
-        default=4,
+        default=5,
         help="Number of images that should be generated during validation with `validation_prompt`.",
     )
     parser.add_argument(
@@ -789,11 +865,11 @@ def parse_args(input_args=None):
     parser.add_argument("--assets_indices_lists", type=parse_list_of_lists, default=[], help="Input as '1,2,3;4,5,6;7,8,9' for [[1, 2, 3], [4, 5, 6], [7, 8, 9]]")
     # parser.add_argument("--initializer_tokens", type=str, nargs="+", default=[])
     parser.add_argument("--initializer_tokens_list", type=parse_nested_list_of_strings, default=[], help="Input nested lists as 'str1,str2;str3,str4'")
-    parser.add_argument("--val_mix_prompts", 
-                        nargs='+',
-                        default=None,
-                        help="A list of prompts that are sampled during validation for inference.",
-    )
+    # parser.add_argument("--val_mix_prompts", 
+    #                     nargs='+',
+    #                     default=None,
+    #                     help="A list of prompts that are sampled during validation for inference.",
+    # )
     parser.add_argument("--final_inference_prompts", 
                         nargs='+',
                         default=None,
@@ -918,6 +994,11 @@ def parse_args(input_args=None):
         default=1.0,
         help="scale for the seg loss in train_concept_predictor loss. If 1.0, it's averagly 1/10 of the classification loss.",
     )
+    parser.add_argument(
+        "--train_token_embeds",
+        action="store_true",
+        help="Whether to train the token embeddings.",
+    )
 
     #####--------------------------------------------------------------------#####
 
@@ -952,406 +1033,6 @@ def parse_args(input_args=None):
                 warnings.warn("Class_prompt should be provided as jsonl")
 
     return args
-
-
-class DreamBoothDataset(Dataset):
-    """
-    A dataset to prepare the instance and class images with the prompts for fine-tuning the model.
-    It pre-processes the images.
-    """
-
-    def __init__(
-        self,
-        train_data_root,
-        class_prompt=None,
-        class_data_root=None,
-        class_num=None,
-        size=1024,
-        repeats=1,
-        center_crop=False,
-        image_column='file_name',
-        caption_column='text',
-        id_column='id',
-        mask_column="mask_path",
-        segmix_prob=0.6,
-        segmix_centercrop=True,
-        soft_alpha=0.
-    ):
-        self.size = size
-        self.center_crop = center_crop
-
-        self.custom_instance_prompts = None
-        self.class_prompt = class_prompt
-        self.soft_alpha = soft_alpha
-
-        # if --dataset_name is provided or a metadata jsonl file is provided in the local --instance_data directory,
-        # we load the training data using load_dataset
-        if args.dataset_name is not None:
-            try:
-                from datasets import load_dataset
-            except ImportError:
-                raise ImportError(
-                    "You are trying to load your data using the datasets library. If you wish to train using custom "
-                    "captions please install the datasets library: `pip install datasets`. If you wish to load a "
-                    "local folder containing images only, specify --instance_data_dir instead."
-                )
-            # Downloading and loading a dataset from the hub.
-            # See more about loading custom images at
-            # https://huggingface.co/docs/datasets/v2.0.0/en/dataset_script
-            dataset = load_dataset(
-                args.dataset_name,
-                args.dataset_config_name,
-                cache_dir=args.cache_dir,
-            )
-            # Preprocessing the datasets.
-            column_names = dataset["train"].column_names
-
-            # 6. Get the column names for input/target.
-            if args.image_column is None:
-                image_column = column_names[0]
-                logger.info(f"image column defaulting to {image_column}")
-            else:
-                image_column = args.image_column
-                if image_column not in column_names:
-                    raise ValueError(
-                        f"`--image_column` value '{args.image_column}' not found in dataset columns. Dataset columns are: {', '.join(column_names)}"
-                    )
-            instance_images = dataset["train"][image_column]
-
-            if args.caption_column is None:
-                logger.info(
-                    "No caption column provided, defaulting to instance_prompt for all images. If your dataset "
-                    "contains captions/prompts for the images, make sure to specify the "
-                    "column as --caption_column"
-                )
-                self.custom_instance_prompts = None
-            else:
-                if args.caption_column not in column_names:
-                    raise ValueError(
-                        f"`--caption_column` value '{args.caption_column}' not found in dataset columns. Dataset columns are: {', '.join(column_names)}"
-                    )
-                custom_instance_prompts = dataset["train"][args.caption_column]
-                # create final list of captions according to --repeats
-                self.custom_instance_prompts = []
-                for caption in custom_instance_prompts:
-                    self.custom_instance_prompts.extend(itertools.repeat(caption, repeats))
-        else:
-            # Set train data root
-            self.train_data_root = Path(train_data_root) #Path(train_data_root)
-            self.metadata_path = self.train_data_root.joinpath("metadata.jsonl")
-            if not self.metadata_path.exists():
-                raise ValueError(f"metadata.jsonl doesn't exists in {self.train_data_root}.")
-            instance_dict_list = []
-            with open(self.metadata_path, 'r') as f:
-                for line in f:
-                    # instance_dict_list.append(json.loads(line))
-                    try:
-                        instance_dict_list.append(json.loads(line))
-                    except: 
-                        break
-
-        info = instance_dict_list[0]
-        self.id_to_placeholder = info['id'] # {"a": "sks can", "b": "olis toy" ...}
-        self.category_list = list(self.id_to_placeholder.keys()) # ['sks dog', 'olis toy']
-        scale = args.relative_scale
-        assert abs(scale) <= 1.
-        if scale > 0:
-            scale_dict = {"a": 1., "b": scale}
-        elif scale < 0:
-            scale_dict = {"a": abs(scale), "b": 1.}
-        else:
-            scale_dict = None
-        self.scale_dict = scale_dict # info.get('scale') # {"a": 1.0, "b": 0.5}
-        global placeholders
-        placeholders = list(c.split(' ')[0] for c in self.id_to_placeholder.values()) # ['sks', 'olis']
-
-        self.category_instance_images = defaultdict(list)
-
-        instance_image_caption = []
-        for instance_dict in instance_dict_list[1:]:
-            img_path = self.train_data_root.joinpath(instance_dict[image_column])
-            img = Image.open(img_path)
-            img = exif_transpose(img)
-            if not img.mode == "RGB":
-                img = img.convert("RGB")
-            # img = self.image_transforms(img)
-            mask_path = self.train_data_root.joinpath(instance_dict[mask_column])
-            mask = Image.open(mask_path)
-            caption = instance_dict[caption_column]
-            
-            category = instance_dict[id_column] # 'a'
-            self.category_instance_images[category].append({"image":img, "mask":mask})
-
-            instance_image_caption.append((img, mask, caption, category)) 
-
-
-        self.instance_images_captions = []
-        for img, mask, caption, category in instance_image_caption:
-            self.instance_images_captions.extend(itertools.repeat((img, mask, caption, category), repeats))
-        self.num_instance_images = len(self.instance_images_captions)
-        self._length = self.num_instance_images
-
-        if class_data_root is not None:
-            self.class_data_root = Path(class_data_root) #Path(class_data_root)
-            self.class_data_root.mkdir(parents=True, exist_ok=True)
-            self.class_images_path = list(self.class_data_root.iterdir())
-
-            self.class_metadata_path = self.class_data_root.joinpath("class_metadata.jsonl")
-            if self.class_metadata_path.exists():
-                class_dict_list = []
-                with open(self.class_metadata_path, 'r') as f:
-                    for line in f:
-                        try:
-                            class_dict_list.append(json.loads(line))
-                        except: 
-                            break
-            else:
-                assert self.class_prompt is not None, ValueError(f"class_metadata.jsonl doesn't exists in {self.train_data_root}.")
-                class_dict_list = None
-
-            if class_num is not None:
-                self.num_class_images = min(len(self.class_images_path), class_num)
-            else:
-                self.num_class_images = len(self.class_images_path)
-            self._length = max(self.num_class_images, self.num_instance_images)
-
-            class_image_caption = []
-            if class_dict_list is not None:
-                prior_info = class_dict_list[0]
-                self.prior_id_to_placeholder = prior_info['id'] # {"a": "dog", "b": "toy" ...}
-                self.prior_category_list = list(self.prior_id_to_placeholder.keys()) # ['dog', 'toy']
-                self.prior_category_instance_images = defaultdict(list)
-
-                for class_dict in class_dict_list[1:]:
-                    img_path = self.class_data_root.joinpath(class_dict[image_column])
-                    img = Image.open(img_path)
-                    img = exif_transpose(img)
-                    if not img.mode == "RGB":
-                        img = img.convert("RGB")
-
-                    mask_path = self.class_data_root.joinpath(class_dict[mask_column])
-                    mask = Image.open(mask_path)
-
-                    caption = class_dict[caption_column]
-                    category = class_dict[id_column] # 'a'
-                    self.prior_category_instance_images[category].append({'image':img, 'caption':caption, 'mask':mask})
-            else:
-                raise NotImplementedError("Currently only support class_metadata.jsonl")
-        else:
-            self.class_data_root = None
-
-        self.image_transforms = transforms.Compose(
-            [
-                transforms.Resize(size, interpolation=transforms.InterpolationMode.BILINEAR),
-                transforms.CenterCrop(size) if center_crop else transforms.RandomCrop(size),
-                transforms.ToTensor(),
-                transforms.Normalize([0.5], [0.5]),
-            ]
-        )
-        self.segmix_transforms = transforms.Compose(
-            [
-                transforms.Resize(size, interpolation=transforms.InterpolationMode.BILINEAR),
-                transforms.CenterCrop((size, size // 2)) if segmix_centercrop else transforms.RandomCrop((size, size // 2)),
-                transforms.ToTensor(),
-                transforms.Normalize([0.5], [0.5]),
-            ]
-        )
-        self.segmix_template = "a photo of a {} and a {}, simple background."
-        self.segmix_prob = segmix_prob
-        self.prior_segmix_template = "a photo of a {} and a {}, simple background."
-        self.start_segmix = False
-
-    def __len__(self):
-        return self._length
-    
-    def mask_background(self, img, mask, mask_value=255):
-        # mask_value: default white
-        img = np.array(img)
-        mask = np.array(mask)
-        binary_mask = mask < 122
-        img[binary_mask] = mask_value
-
-        return Image.fromarray(img)
-   
-    def bbox_mask(self, mask_image):
-        """
-        mask: PIL.Image
-        return: list
-        """
-        # Convert the PIL image to a NumPy array
-        mask = np.array(mask_image)
-        # Apply a threshold to binarize the mask
-        threshold_value = 128  # You might need to adjust this value
-        mask_binary = (mask > threshold_value).astype(np.uint8) * 255
-        # Find the bounding box of the non-zero regions in the binary mask
-        rows = np.any(mask_binary, axis=1)
-        cols = np.any(mask_binary, axis=0)
-        ymin, ymax = np.where(rows)[0][[0, -1]]
-        xmin, xmax = np.where(cols)[0][[0, -1]]
-        # The bounding box is defined by the coordinates (xmin, ymin) and (xmax, ymax).
-        bbox = (xmin, ymin, xmax, ymax)
-        return bbox
-
-    def image_process(self, image, mask, margin=32, fixed_scale=None):
-        """
-        Crop the image and mask, based on the bbox of mask map.
-        The resize width is 512, and there is an optional mergin.
-
-        image: PIL.Image
-        mask: PIL.Image
-        """
-
-        bbox = self.bbox_mask(mask)
-        image = image.crop((bbox[0], bbox[1], bbox[2], bbox[3]))
-        mask = mask.crop((bbox[0], bbox[1], bbox[2], bbox[3]))
-        width, height = image.size
-
-        if fixed_scale is not None:
-            rescaling_factor = min((512 - margin) / width, (1024 - margin) / height) * fixed_scale 
-        else:
-            max_factor = min((512 - margin) / width, (1024 - margin) / height)
-            rescaling_factor = np.random.uniform(max_factor * 0.75, max_factor)
-    
-        image = image.resize((int(width * rescaling_factor), int(height * rescaling_factor)))
-        mask = mask.resize((int(width * rescaling_factor), int(height * rescaling_factor)))
-
-        return image, mask 
-
-    def image_collage(self, image_0, mask_0, image_1, mask_1, white=False, margin_max=10, height_sync=False):
-        """
-        Returns a collage of two images with a mask map.
-        """
-        rgb_back = 255 if white else 0
-        background = np.zeros((1024, 1024, 3), dtype=np.uint8)
-        mask_map = np.zeros((1024, 1024))
-
-        if height_sync:
-            y_max_sync = 1024 - max(image_0.size[1], image_1.size[1])
-            y_sync = random.randint(0, y_max_sync) if y_max_sync > 0 else 0
-            y_pos_0, y_pos_1 = y_sync, y_sync
-        else:
-            y_max_0 = 1024 - image_0.size[1]
-            y_max_1 = 1024 - image_1.size[1]
-            y_pos_0 = random.randint(0, y_max_0)
-            y_pos_1 = random.randint(0, y_max_1)
-
-        image_0 = np.array(image_0)
-        binary_mask_0 = np.array(mask_0) > 122
-        image_0[binary_mask_0 == 0] = 0 # background goes to 0
-
-        image_1 = np.array(image_1)
-        binary_mask_1 = np.array(mask_1) > 122
-        image_1[binary_mask_1 == 0] = 0 
-        
-        # Determin which image goes on top
-        is_left = True if random.random() < 0.5 else False
-
-        # margin for x axis
-        left_margin = random.randint(1, margin_max)
-        right_margin = random.randint(1, margin_max)
-
-        mask_map[y_pos_0:y_pos_0 + binary_mask_0.shape[0], left_margin:left_margin + binary_mask_0.shape[1]] += binary_mask_0
-        mask_map[y_pos_1:y_pos_1 + binary_mask_1.shape[0], -right_margin - binary_mask_1.shape[1]:-right_margin] += binary_mask_1
-
-        merged_mask_map = mask_map > 0
-        union_mask_map = mask_map > 1.5
-
-        if is_left:
-            background[y_pos_0:y_pos_0 + image_0.shape[0], left_margin:left_margin + image_0.shape[1]] = image_0 
-            background[union_mask_map] = 0
-            background[y_pos_1:y_pos_1 + image_1.shape[0], -right_margin - image_1.shape[1] :-right_margin] += image_1 
-        else:
-            background[y_pos_1:y_pos_1 + image_1.shape[0], -right_margin - image_1.shape[1] :-right_margin] = image_1
-            background[union_mask_map] = 0
-            background[y_pos_0:y_pos_0 + image_0.shape[0], left_margin:left_margin + image_0.shape[1]] += image_0 
-        
-        if white:
-            background[merged_mask_map == 0] = 255
-
-        return Image.fromarray(background), merged_mask_map
-
-    def mask_to_tensor(self, mask):
-        """
-        mask: np.array bool (1024, 1024)
-        """
-        float_tensor_map  = torch.tensor(mask, dtype=torch.float32)
-        float_tensor_map = torch.nn.functional.interpolate(float_tensor_map.unsqueeze(0).unsqueeze(0), size=(128, 128), mode='bilinear')
-
-        return float_tensor_map.squeeze(0) # 1, 128, 128
-
-    def __getitem__(self, index):
-        example = {}
-        instance_image, mask, caption, category = self.instance_images_captions[index % self.num_instance_images]
-
-        # default (no segmix)
-        do_segmix = False
-
-        if random.random() < self.segmix_prob:
-            do_segmix = True
-
-        is_first = None
-        if do_segmix and self.start_segmix:
-            additional_category = random.choice([c for c in self.category_list if c != category])
-            additional_instance_dict = random.choice(self.category_instance_images[additional_category])
-            additional_instance_image, additional_instance_mask = additional_instance_dict["image"], additional_instance_dict["mask"]
-
-            image_0, mask_0 = self.image_process(instance_image, mask, fixed_scale=self.scale_dict[category] if self.scale_dict else None)
-            image_1, mask_1 = self.image_process(additional_instance_image, additional_instance_mask, fixed_scale=self.scale_dict[additional_category] if self.scale_dict else None)
-
-            is_first = random.random() < 0.5
-            if is_first:
-                merged, merged_mask_map = self.image_collage(image_0, mask_0, image_1, mask_1, white=True, margin_max=256, height_sync=False)
-            else:
-                merged, merged_mask_map = self.image_collage(image_1, mask_1, image_0, mask_0, white=True, margin_max=256, height_sync=False)
-
-            example["instance_images"] = self.image_transforms(merged)
-            example["instance_prompt"] = self.segmix_template.format(self.id_to_placeholder[category], self.id_to_placeholder[additional_category])
-
-            example["mask_map"] = self.mask_to_tensor(merged_mask_map) * (1 - self.soft_alpha) + self.soft_alpha
-
-        else:
-            example["instance_images"] = self.image_transforms(instance_image)
-            if isinstance(caption, (list, np.ndarray)):
-                caption = random.choice(caption)
-            example["instance_prompt"] = caption
-            example["mask_map"] = torch.ones(1, self.size // 8, self.size // 8, dtype=torch.float32)
-
-        example["do_segmix"] = do_segmix
-        example["is_first"] = is_first
-
-        if self.class_data_root:
-            # class_image, class_caption, category = self.class_images_captions[index % self.num_class_images]
-            class_dict = self.prior_category_instance_images[category][index % len(self.prior_category_instance_images[category])]
-            class_image = class_dict['image']
-            class_caption = class_dict['caption']
-
-            if not class_image.mode == "RGB":
-                class_image = class_image.convert("RGB")
-            if do_segmix and self.start_segmix:
-                class_mask = class_dict['mask']
-
-                additional_category = random.choice([c for c in self.prior_category_list if c != category]) if len(self.prior_category_list) > 1 else category
-                additional_dict = random.choice(self.prior_category_instance_images[additional_category])
-                additional_class_image, additional_class_mask = additional_dict['image'], additional_dict['mask']
-
-                image_0, mask_0 = self.image_process(class_image, class_mask, fixed_scale=None)
-                image_1, mask_1 = self.image_process(additional_class_image, additional_class_mask, fixed_scale=None)
-
-                merged, class_mask_map = self.image_collage(image_0, mask_0, image_1, mask_1, white=True, margin_max=256, height_sync=True)
-                example["class_images"] = self.image_transforms(merged)
-
-                class_mask_map = self.mask_to_tensor(class_mask_map)
-                example["class_mask_map"] = class_mask_map * (1 - self.soft_alpha) + self.soft_alpha
-                example["class_prompt"] = self.prior_segmix_template.format(self.prior_id_to_placeholder[category], 
-                                                                            self.prior_id_to_placeholder[additional_category])
-            else:
-                example["class_images"] = self.image_transforms(class_image)
-                example["class_prompt"] = class_caption
-                example["class_mask_map"] = torch.ones(1, self.size // 8, self.size // 8, dtype=torch.float32)
-
-        #TODO: Check here for the prompts - just feed in the data as original
-
-        return example
 
 
 def collate_fn(examples, with_prior_preservation=False):
@@ -1442,6 +1123,9 @@ def ensure_mask_format(mask):
     return mask
 
 def main(args):
+    now = datetime.now()
+    date_time_string = now.strftime("%Y-%m-%d-%H-%M")
+
     if args.report_to == "wandb" and args.hub_token is not None:
         raise ValueError(
             "You cannot use both --report_to=wandb and --hub_token due to a security risk of exposing your token."
@@ -1650,8 +1334,21 @@ def main(args):
 
     # We only train the additional adapter LoRA layers
     vae.requires_grad_(False)
+    vae.to(accelerator.device, dtype=torch.float16)
     text_encoder_one.requires_grad_(False)
     text_encoder_two.requires_grad_(False)
+
+    ###########
+    # # Enable gradients only on concept token embeddings
+    if args.train_token_embeds:
+        embedding_1 = text_encoder_one.get_input_embeddings()
+        embedding_2 = text_encoder_two.get_input_embeddings()
+
+        # Ensure the embedding weight as a whole is marked trainable
+        embedding_1.weight.requires_grad = True
+        embedding_2.weight.requires_grad = True
+    #############
+
     unet.requires_grad_(False)
 
     # For mixed precision training we cast all non-trainable weights (vae, non-lora text_encoder and non-lora unet) to half-precision
@@ -1680,7 +1377,7 @@ def main(args):
     #####--------- Initialize the concept predictor ---------#####
     if args.train_concept_predictor:
         concept_predictor = ConceptClassifierSegmenter(
-            latent_channels=4, latent_size=64, out_dim=NUM_TOKENS, hidden_dim=256
+            latent_channels=4, latent_size=128, out_dim=len(all_placeholder_tokens), hidden_dim=256
         ).to(accelerator.device)
         concept_predictor.train()
     #####----------------------------------------------------#####
@@ -2061,6 +1758,9 @@ def main(args):
         )
         accelerator.init_trackers(tracker_name, config=vars(args))
 
+        if args.report_to == "wandb":
+            wandb.run.name = args.run_name + "_" + date_time_string
+
     # Train!
     total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
 
@@ -2134,6 +1834,8 @@ def main(args):
             accelerator.unwrap_model(text_encoder_two).text_model.embeddings.requires_grad_(True)
 
         for step, batch in enumerate(train_dataloader):
+            logs = {}
+
             if global_step == args.segmix_start_step:
                 print("start segmix")
                 train_dataset.start_segmix = True
@@ -2161,7 +1863,7 @@ def main(args):
                 # Sample noise that we'll add to the latents
                 noise = torch.randn_like(model_input)
                 bsz = model_input.shape[0]
-                print(f"batch size: {bsz}")
+                # print(f"batch size: {bsz}")
 
                 # Sample a random timestep for each image
                 if not args.do_edm_style_training:
@@ -2307,7 +2009,7 @@ def main(args):
                         prior_loss = (prior_loss * prior_mask).mean()
 
                 if args.snr_gamma is None:
-                    print(f'Check snr_gamma is None')
+                    # print(f'Check snr_gamma is None')
                     if weighting is not None:
                         print(f'Check weighting is not None')
                         loss = torch.mean(
@@ -2329,7 +2031,7 @@ def main(args):
                             inside_term = -1 * args.dco_beta * diff
                             loss = -1 * torch.nn.LogSigmoid()(inside_term)
                     else:
-                        print(f'Check weighting is None')
+                        # print(f'Check weighting is None')
                         # loss = F.mse_loss(model_pred.float(), target.float(), reduction="none")
                         # loss = (loss * mask).mean()
                         #####---------- Added for masks produced by dynamic data synth ----------#####
@@ -2411,6 +2113,7 @@ def main(args):
                             loss = -1 * torch.nn.LogSigmoid()(inside_term)
                 else:
                     raise NotImplementedError("SNR-based loss weights are not yet supported.")
+                logs["mask_diff_loss"] = loss.detach().item()
 
                 #####---------- Added concept predictor ----------#####
                 if args.train_concept_predictor:
@@ -2435,15 +2138,16 @@ def main(args):
                     if inst_masks.ndim == 5:
                         inst_masks = inst_masks.squeeze(2)
 
-                    synth_masks = F.interpolate(synth_masks, size=(64, 64), mode="nearest")
-                    inst_masks = F.interpolate(inst_masks, size=(64, 64), mode="nearest")
+                    synth_masks = F.interpolate(synth_masks, size=(128, 128), mode="nearest")
+                    inst_masks = F.interpolate(inst_masks, size=(128, 128), mode="nearest")
                     synth_masks = (synth_masks > 0.1).float()
                     inst_masks = (inst_masks > 0.1).float()
                     mask_list = [synth_masks, inst_masks]
 
                     concept_pred_loss = 0.0
                     for i, (latents_i, token_ids_i, masks_i) in enumerate(zip([denoised_synth, denoised_inst], token_id_list, mask_list)):
-                        logits_cls, logits_mask = concept_predictor(latents_i.unsqueeze(0))  # (1, C), (1, C, 64, 64)
+                        # print(f"latents_i shape: {latents_i.shape}")
+                        logits_cls, logits_mask = concept_predictor(latents_i)  # (1, C), (1, C, 64, 64)
 
                         cls_labels = torch.zeros_like(logits_cls)
                         for tid in token_ids_i[0]:
@@ -2469,6 +2173,19 @@ def main(args):
                     loss = loss + args.prior_loss_weight * prior_loss
 
                 accelerator.backward(loss)
+
+                if args.train_token_embeds:
+                    with torch.no_grad():
+                        grad_1 = embedding_1.weight.grad
+                        grad_2 = embedding_2.weight.grad
+                        mask_1 = torch.zeros_like(grad_1)
+                        mask_2 = torch.zeros_like(grad_2)
+                        for token_id in placeholder_token_ids:
+                            mask_1[token_id] = 1
+                            mask_2[token_id] = 1
+                        grad_1 *= mask_1
+                        grad_2 *= mask_2
+
                 if accelerator.sync_gradients:
                     params_to_clip = (
                         itertools.chain(unet_lora_parameters, text_lora_parameters_one, text_lora_parameters_two)
@@ -2544,7 +2261,9 @@ def main(args):
 
                         del unet_lora_layers
                         torch.cuda.empty_cache()
-            logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+            # logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+            logs["loss"] = loss.detach().item()
+            logs["lr"] = lr_scheduler.get_last_lr()[0]
             progress_bar.set_postfix(**logs)
             accelerator.log(logs, step=global_step)
 
@@ -2552,7 +2271,8 @@ def main(args):
                 break
 
         if accelerator.is_main_process:
-            if args.validation_prompt is not None and epoch % args.validation_epochs == 0:
+            # if args.validation_prompt is not None and epoch % args.validation_epochs == 0:
+            if args.val_ori_prompts and args.val_mix_prompts and epoch % args.validation_epochs == 0:
                 pipeline = StableDiffusionXLPipeline.from_pretrained(
                     args.pretrained_model_name_or_path,
                     vae=vae,
@@ -2563,8 +2283,26 @@ def main(args):
                     variant=args.variant,
                     torch_dtype=weight_dtype,
                 )
-                pipeline_args = {"prompt": args.validation_prompt}
+                # pipeline_args = {"prompt": args.validation_prompt}
 
+                # images = log_validation(
+                #     pipeline,
+                #     args,
+                #     accelerator,
+                #     pipeline_args,
+                #     epoch,
+                # )
+
+                pipeline_args = {"prompt": args.val_ori_prompts, "validation_type": 'ori', "num_inference_steps": 25}
+                images = log_validation(
+                    pipeline,
+                    args,
+                    accelerator,
+                    pipeline_args,
+                    epoch,
+                )
+
+                pipeline_args = {"prompt": args.val_mix_prompts, "validation_type": 'mix', "num_inference_steps": 25}
                 images = log_validation(
                     pipeline,
                     args,
@@ -2627,8 +2365,28 @@ def main(args):
 
         # run inference
         images = []
-        if args.validation_prompt and args.num_validation_images > 0:
-            pipeline_args = {"prompt": args.validation_prompt, "num_inference_steps": 25}
+        # if args.validation_prompt and args.num_validation_images > 0:
+        #     pipeline_args = {"prompt": args.validation_prompt, "num_inference_steps": 25}
+        #     images = log_validation(
+        #         pipeline,
+        #         args,
+        #         accelerator,
+        #         pipeline_args,
+        #         epoch,
+        #         is_final_validation=True,
+        #     )
+        if args.val_ori_prompts and args.val_mix_prompts and args.num_validation_images > 0:
+            # pipeline_args = {"prompt": args.validation_prompt, "num_inference_steps": 25}
+            pipeline_args = {"prompt": args.val_ori_prompts, "validation_type": 'ori', "num_inference_steps": 25}
+            images = log_validation(
+                pipeline,
+                args,
+                accelerator,
+                pipeline_args,
+                epoch,
+            )
+            
+            pipeline_args = {"prompt": args.val_mix_prompts, "validation_type": 'mix', "num_inference_steps": 25}
             images = log_validation(
                 pipeline,
                 args,

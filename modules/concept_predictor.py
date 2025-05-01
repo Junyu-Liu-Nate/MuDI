@@ -10,7 +10,7 @@ class ConceptClassifierSegmenter(nn.Module):
       (1) which concept tokens appear in a given latent (multi-label classification), and
       (2) where each concept appears via a per-concept mask (logits_mask).
     """
-    def __init__(self, latent_channels=4, latent_size=64, out_dim=8, hidden_dim=256):
+    def __init__(self, latent_channels=4, latent_size=128, out_dim=8, hidden_dim=256):
         super().__init__()
         """
         Args:

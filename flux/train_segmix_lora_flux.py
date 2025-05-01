@@ -1238,21 +1238,52 @@ def main(args):
         args.pretrained_model_name_or_path, args.revision, subfolder="text_encoder_2"
     )
 
+    # ------------------------------------------------------------------
+    # Determine the dtype we will use when streaming checkpoints
+    weight_dtype = torch.bfloat16 if args.mixed_precision == "bf16" else (
+        torch.float16 if args.mixed_precision == "fp16" else torch.float32
+    )
+    # ------------------------------------------------------------------
+
     # Load scheduler and models
     noise_scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="scheduler"
     )
     noise_scheduler_copy = copy.deepcopy(noise_scheduler)
     text_encoder_one, text_encoder_two = load_text_encoders(text_encoder_cls_one, text_encoder_cls_two)
+    # vae = AutoencoderKL.from_pretrained(
+    #     args.pretrained_model_name_or_path,
+    #     subfolder="vae",
+    #     revision=args.revision,
+    #     variant=args.variant,
+    # )
     vae = AutoencoderKL.from_pretrained(
         args.pretrained_model_name_or_path,
         subfolder="vae",
         revision=args.revision,
         variant=args.variant,
+        torch_dtype=weight_dtype,
+        low_cpu_mem_usage=True,
+        device_map={"": accelerator.device}
     )
+    # transformer = FluxTransformer2DModel.from_pretrained(
+    #     args.pretrained_model_name_or_path, subfolder="transformer", revision=args.revision, variant=args.variant
+    # )
     transformer = FluxTransformer2DModel.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="transformer", revision=args.revision, variant=args.variant
+        args.pretrained_model_name_or_path,
+        subfolder="transformer",
+        revision=args.revision,
+        variant=args.variant,
+        torch_dtype=weight_dtype,          # ➊ load directly in bf16/fp16/fp32
+        low_cpu_mem_usage=True,            # ➋ stream layer‑by‑layer, no big CPU tensor
+        device_map={"": accelerator.device}# ➌ send every layer straight to the GPU
     )
+    from diffusers.models.attention_processor import AttnProcessor
+    # transformer.set_attn_processor(AttnProcessor())   # 1‑D slice = lowest RAM
+    import torch.backends.cuda as torch_cuda
+    torch_cuda.enable_flash_sdp(True)      # global flag for flash attention
+    torch_cuda.enable_mem_efficient_sdp(True)  # (optional, same effect on Ampere+)
+    # transformer.enable_torch_sdpa()        # diffusers helper
 
     # We only train the additional adapter LoRA layers
     transformer.requires_grad_(False)
@@ -1276,8 +1307,8 @@ def main(args):
 
     vae.to(accelerator.device, dtype=weight_dtype)
     transformer.to(accelerator.device, dtype=weight_dtype)
-    text_encoder_one.to(accelerator.device, dtype=weight_dtype)
-    text_encoder_two.to(accelerator.device, dtype=weight_dtype)
+    # text_encoder_one.to(accelerator.device, dtype=weight_dtype)
+    # text_encoder_two.to(accelerator.device, dtype=weight_dtype)
 
     if args.gradient_checkpointing:
         transformer.enable_gradient_checkpointing()
@@ -1652,14 +1683,26 @@ def main(args):
                 tokens_two = tokenize_prompt(
                     tokenizer_two, prompts, max_sequence_length=args.max_sequence_length
                 )
+                # prompt_embeds, pooled_prompt_embeds, text_ids = encode_prompt(
+                #     text_encoders=[text_encoder_one, text_encoder_two],
+                #     tokenizers=[None, None],
+                #     text_input_ids_list=[tokens_one, tokens_two],
+                #     max_sequence_length=args.max_sequence_length,
+                #     device=accelerator.device,
+                #     prompt=prompts,
+                # )
                 prompt_embeds, pooled_prompt_embeds, text_ids = encode_prompt(
                     text_encoders=[text_encoder_one, text_encoder_two],
                     tokenizers=[None, None],
                     text_input_ids_list=[tokens_one, tokens_two],
                     max_sequence_length=args.max_sequence_length,
-                    device=accelerator.device,
+                    device=None,                 # ← keep T5 encoder on CPU
                     prompt=prompts,
                 )
+                # move the *tiny* embeddings to GPU
+                prompt_embeds       = prompt_embeds.to(device=accelerator.device)
+                pooled_prompt_embeds= pooled_prompt_embeds.to(device=accelerator.device)
+                text_ids            = text_ids.to(device=accelerator.device)
 
                 # Convert images to latent space
                 if args.cache_latents:
