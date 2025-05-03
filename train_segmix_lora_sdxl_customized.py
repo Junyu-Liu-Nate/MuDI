@@ -2162,9 +2162,10 @@ def main(args):
 
                         seg_loss = F.binary_cross_entropy_with_logits(logits_mask, gt_mask)
                         concept_pred_loss += cls_loss + args.concept_pred_seg_scale * seg_loss
-
+                    
                     # Scale and add to total loss
-                    loss = loss + args.concept_pred_weight * concept_pred_loss
+                    concept_pred_loss = args.concept_pred_weight * concept_pred_loss
+                    loss = loss + concept_pred_loss
                     logs["info_loss"] = concept_pred_loss.detach().item()
                 #####------------------------------------------------------------#####
 
@@ -2197,6 +2198,8 @@ def main(args):
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
+
+                ###TODO: Need to check whether the embs are updated - have gradients
 
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
