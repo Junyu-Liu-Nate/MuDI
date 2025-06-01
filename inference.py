@@ -44,43 +44,105 @@ def get_start(seq, margin, width, img_w, num_subjects):
     else:
         return (width // (num_subjects*2)) * (2*seq +1) - (img_w //2)
 
-def image_collage(images_, image_map_size=(3,1024,1024), margin=10, height_sync=False, device='cpu', dtype=torch.float32):
+# def image_collage(images_, image_map_size=(3,1024,1024), margin=10, height_sync=False, device='cpu', dtype=torch.float32):
+#     num_subjects = len(images_)
+#     idxs = random.sample(range(num_subjects), num_subjects)
+#     imgs, masks = [], []
+#     for idx in idxs:
+#         pil_img, pil_mask = images_[idx]['image'], images_[idx]['mask']
+#         tensor_img = F.to_tensor(pil_img).to(device=device, dtype=dtype)
+#         tensor_mask = F.to_tensor(pil_mask).to(device=device, dtype=dtype)
+#         masks.append(tensor_mask)
+#         imgs.append(tensor_img)
+#     _, H, W = image_map_size
+#     image_map = torch.zeros((3,H,W), device=device, dtype=dtype)
+#     mask_map = torch.zeros((H,W), device=device, dtype=dtype)
+#     y_positions = []
+#     if height_sync:
+#         max_h = max(img.size(1) for img in imgs)
+#         y_sync = random.randint(0, H - max_h) if H > max_h else 0
+#         y_positions = [y_sync]*num_subjects
+#     else:
+#         for img in imgs:
+#             img_h = img.size(1)
+#             y_positions.append(random.randint(0, max(0, H - img_h)))
+#     x_margins = [random.randint(1,margin)] + [random.randint(-margin,margin) for _ in range(num_subjects-2)] + [random.randint(1,margin)]
+#     sequence = random.sample(range(num_subjects), num_subjects)
+#     for seq in sequence:
+#         img, mask = imgs[seq], masks[seq]
+#         y_pos, x_margin = y_positions[seq], x_margins[seq]
+#         img_h, img_w = img.size(1), img.size(2)
+#         x_start = get_start(seq, x_margin, W, img_w, num_subjects)
+#         mask_squeezed = mask if mask.dim()==2 else mask[0]
+#         mask_map[y_pos:y_pos+img_h, x_start:x_start+img_w] += mask_squeezed
+#         union_mask = (mask_map>1.5)
+#         image_map[:, union_mask] = 0
+#         image_map[:, y_pos:y_pos+img_h, x_start:x_start+img_w] += img * mask
+#         mask_map = (mask_map>0).to(dtype=dtype)
+#     image_map[:, mask_map==0] = 255
+#     return F.to_pil_image(image_map.clamp(0,1).cpu()), F.to_pil_image(mask_map.unsqueeze(0).clamp(0,1).cpu())
+
+def image_collage(images_, image_map_size=(3, 1024, 1024), margin=10, height_sync=False, device='cpu', dtype=torch.float32):
     num_subjects = len(images_)
     idxs = random.sample(range(num_subjects), num_subjects)
     imgs, masks = [], []
+
     for idx in idxs:
         pil_img, pil_mask = images_[idx]['image'], images_[idx]['mask']
         tensor_img = F.to_tensor(pil_img).to(device=device, dtype=dtype)
         tensor_mask = F.to_tensor(pil_mask).to(device=device, dtype=dtype)
         masks.append(tensor_mask)
         imgs.append(tensor_img)
+
     _, H, W = image_map_size
-    image_map = torch.zeros((3,H,W), device=device, dtype=dtype)
-    mask_map = torch.zeros((H,W), device=device, dtype=dtype)
+    image_map = torch.zeros((3, H, W), device=device, dtype=dtype)
+    mask_map = torch.zeros((H, W), device=device, dtype=dtype)
+
+    # Compute Y positions
     y_positions = []
     if height_sync:
         max_h = max(img.size(1) for img in imgs)
         y_sync = random.randint(0, H - max_h) if H > max_h else 0
-        y_positions = [y_sync]*num_subjects
+        y_positions = [y_sync] * num_subjects
     else:
         for img in imgs:
             img_h = img.size(1)
             y_positions.append(random.randint(0, max(0, H - img_h)))
-    x_margins = [random.randint(1,margin)] + [random.randint(-margin,margin) for _ in range(num_subjects-2)] + [random.randint(1,margin)]
+
+    # Compute X margins and random sequence
+    x_margins = [random.randint(1, margin)] + [random.randint(-margin, margin) for _ in range(num_subjects - 2)] + [random.randint(1, margin)]
     sequence = random.sample(range(num_subjects), num_subjects)
+
+    # Compose image map
     for seq in sequence:
         img, mask = imgs[seq], masks[seq]
-        y_pos, x_margin = y_positions[seq], x_margins[seq]
+        y_pos = y_positions[seq]
+        x_margin = x_margins[seq]
+
         img_h, img_w = img.size(1), img.size(2)
         x_start = get_start(seq, x_margin, W, img_w, num_subjects)
-        mask_squeezed = mask if mask.dim()==2 else mask[0]
-        mask_map[y_pos:y_pos+img_h, x_start:x_start+img_w] += mask_squeezed
-        union_mask = (mask_map>1.5)
+
+        # Clamp dimensions to stay within canvas bounds
+        if y_pos + img_h > H:
+            img_h = H - y_pos
+            img = img[:, :img_h, :]
+            mask = mask[:, :img_h, :]
+
+        if x_start + img_w > W:
+            img_w = W - x_start
+            img = img[:, :, :img_w]
+            mask = mask[:, :, :img_w]
+
+        # Apply mask
+        mask_squeezed = mask if mask.dim() == 2 else mask[0]
+        mask_map[y_pos:y_pos + img_h, x_start:x_start + img_w] += mask_squeezed
+        union_mask = (mask_map > 1.5)
         image_map[:, union_mask] = 0
-        image_map[:, y_pos:y_pos+img_h, x_start:x_start+img_w] += img * mask
-        mask_map = (mask_map>0).to(dtype=dtype)
-    image_map[:, mask_map==0] = 255
-    return F.to_pil_image(image_map.clamp(0,1).cpu()), F.to_pil_image(mask_map.unsqueeze(0).clamp(0,1).cpu())
+        image_map[:, y_pos:y_pos + img_h, x_start:x_start + img_w] += img * mask
+        mask_map = (mask_map > 0).to(dtype=dtype)
+
+    image_map[:, mask_map == 0] = 255
+    return F.to_pil_image(image_map.clamp(0, 1).cpu()), F.to_pil_image(mask_map.unsqueeze(0).clamp(0, 1).cpu())
 
 def get_timesteps(self, num_inference_steps, strength, device, denoising_start=None):
     if denoising_start is None:
@@ -158,6 +220,9 @@ def main():
                 image, mask = image_process(image, mask, margin=16, fixed_scale=0.8, size_factor=1, out_size=(768, 1344), num_subject=len(prompt_tokens))
                 images_.append({'image': image, 'mask': mask})
 
+        # images_ = [img.resize((1024, 1024), Image.BICUBIC) for img in images_] # Make sure all images are 1024x1024
+        # print(f'images_: {images_}')
+        # exit()
         bg, mask = image_collage(images_, (3, 1024, 1024), margin=32, height_sync=False, device=inference_device, dtype=torch.float16)
         mask_ = mask.resize((mask.size[0] // 8, mask.size[1] // 8))
         mask_ = np.array(mask_) > 0
@@ -170,7 +235,7 @@ def main():
         gamma = 3
 
         # Generate 10 samples per prompt
-        for i in range(10):
+        for i in range(38):
             generator = torch.manual_seed(i)
             noise = randn_tensor(init_latent.shape, device=inference_device, dtype=torch.float16, generator=generator)
             init_latent_ = add_noise(pipe, pipe.vae.config.scaling_factor * init_latent * gamma, strength=1., noise=noise)
